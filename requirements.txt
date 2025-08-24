@@ -11,9 +11,7 @@ ollama
 sentence-transformers
 InstructorEmbedding
 pymupdf
-playwright
 langchain_experimental
 tiktoken
-numpy
 pandas
-fitz
+playwright
