@@ -1,4 +1,5 @@
-# Python virtual environment
+# Python virtual environments
+.venv/
 venv/
 env/
 
@@ -11,10 +12,13 @@ __pycache__/
 # Environment variables (DO NOT COMMIT)
 .env
 
-# Application-specific databases and storage
+# Application data: SQLite archive, vector store, uploaded PDFs
 *.db
 chroma_db/
 temp/
 
-# Streamlit configuration
-.streamlit/
+# Streamlit secrets (config.toml is committed)
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
