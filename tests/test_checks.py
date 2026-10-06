@@ -15,7 +15,15 @@ from rag_agents import (
     _verdict,
     contradictory_ratings,
 )
-from utils import MAX_DOCUMENT_CHARS, _for_agent, extract_page_text, pdf_text
+from utils import (
+    MAX_DOCUMENT_CHARS,
+    AdvancedScrapeTool,
+    DocumentUnreadable,
+    PDFReadTool,
+    _for_agent,
+    extract_page_text,
+    pdf_text,
+)
 
 CIRCULAR_PAGE = """
 <html><head><title>RBI</title><script>var tracking = 1;</script></head>
@@ -106,3 +114,48 @@ class TestTheKnowledgeBase:
         assert {"kyc_policy.md", "products.md"} <= sources
         assert all(c.page_content.strip() for c in chunks)
         assert len(chunks) > len(sources)  # sections, not whole files
+
+
+class TestReadingBeforeTheAgentsStart:
+    """A broken document fails in seconds with its real cause, not after
+    the model has been retried at a tool that cannot succeed."""
+
+    def test_a_missing_pdf_fails_up_front_with_the_reason(self, tmp_path):
+        tool = PDFReadTool(file_path=str(tmp_path / "missing.pdf"))
+        with pytest.raises(DocumentUnreadable, match="could not read the PDF"):
+            tool.prefetch()
+
+    def test_a_non_web_address_is_refused_before_any_fetch(self):
+        with pytest.raises(DocumentUnreadable, match="not an http"):
+            AdvancedScrapeTool(url="file:///etc/passwd").prefetch()
+
+    def test_a_fetch_failure_names_the_real_cause(self, monkeypatch):
+        def broken(url, selector):
+            raise RuntimeError("Executable doesn't exist at /path/to/chromium\nmore detail")
+        monkeypatch.setattr(AdvancedScrapeTool, "_fetch", staticmethod(broken))
+        with pytest.raises(DocumentUnreadable, match="Executable doesn't exist"):
+            AdvancedScrapeTool(url="https://example.org/circular").prefetch()
+
+    def test_the_pre_flight_read_does_not_count_as_the_agent_reading_it(self, tmp_path):
+        """Otherwise the guardrail that checks the agent opened the document
+        would pass without the agent ever calling its tool."""
+        path = tmp_path / "circular.pdf"
+        document = fitz.open()
+        document.new_page().insert_text((72, 72), "Directions on payment aggregators")
+        document.save(path)
+        tool = PDFReadTool(file_path=str(path))
+        tool.prefetch()
+        assert tool.reads == []
+        assert "payment aggregators" in tool._run()
+        assert len(tool.reads) == 1
+
+    def test_the_page_is_fetched_once(self, monkeypatch):
+        calls = []
+        def fetch(url, selector):
+            calls.append(url)
+            return "Circular text"
+        monkeypatch.setattr(AdvancedScrapeTool, "_fetch", staticmethod(fetch))
+        tool = AdvancedScrapeTool(url="https://example.org/circular")
+        tool.prefetch()
+        tool._run()
+        assert calls == ["https://example.org/circular"]

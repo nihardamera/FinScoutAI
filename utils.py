@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup, Comment, NavigableString
 from crewai.tools import BaseTool
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 # About 3,000 Llama 3 tokens of English text.
 MAX_DOCUMENT_CHARS = 12_000
@@ -144,6 +144,10 @@ def pdf_text(data: bytes | None = None, path: str | None = None) -> str:
         return "\n".join(page.get_text() for page in document).strip()
 
 
+class DocumentUnreadable(RuntimeError):
+    """The circular could not be read, so there is nothing for the agents to analyse."""
+
+
 class ToolInput(BaseModel):
     """Base for tool arguments that repairs two common small-model mistakes.
 
@@ -194,21 +198,42 @@ class AdvancedScrapeTool(BaseTool):
     url: str
     css_selector: str | None = None
     reads: list = Field(default_factory=list, exclude=True)
+    _text: str | None = PrivateAttr(default=None)
 
-    def _run(self, **_ignored) -> str:
+    def prefetch(self) -> None:
+        """Fetch the document before any agent runs; raise DocumentUnreadable if it fails.
+
+        Reading the page is ordinary code, so it is done once up front. A page
+        that is down, or a browser that is not installed, then fails in seconds
+        with its real error, instead of after the model has been asked three
+        times to call a tool that cannot succeed. The agent's own call returns
+        this text and is what counts as having read the circular.
+        """
         url = self.url.strip()
         if urlparse(url).scheme not in ("http", "https"):
-            return f"Error: {url!r} is not an http(s) address."
+            raise DocumentUnreadable(f"{url!r} is not an http(s) address.")
         selector = (self.css_selector or "").strip() or None
         try:
             text = self._fetch(url, selector)
-        except Exception as error:  # reported back to the agent as text
+        except Exception as error:
             message = str(error).strip()
-            return f"Error reading {url}: {message.splitlines()[0] if message else type(error).__name__}"
+            raise DocumentUnreadable(
+                f"could not read {url}: "
+                f"{message.splitlines()[0] if message else type(error).__name__}") from error
         if not text:
-            return f"Error reading {url}: the page has no readable text."
-        self.reads.append({"source": url, "selector": selector, "chars": len(text)})
-        return _for_agent(text)
+            raise DocumentUnreadable(f"{url} has no readable text.")
+        self._text = text
+
+    def _run(self, **_ignored) -> str:
+        if self._text is None:
+            try:
+                self.prefetch()
+            except DocumentUnreadable as error:  # reported back to the agent as text
+                return f"Error: {error}"
+        assert self._text is not None
+        selector = (self.css_selector or "").strip() or None
+        self.reads.append({"source": self.url.strip(), "selector": selector, "chars": len(self._text)})
+        return _for_agent(self._text)
 
     @staticmethod
     def _fetch(url: str, selector: str | None) -> str:
@@ -259,13 +284,25 @@ class PDFReadTool(BaseTool):
     args_schema: type[BaseModel] = NoArguments
     file_path: str
     reads: list = Field(default_factory=list, exclude=True)
+    _text: str | None = PrivateAttr(default=None)
 
-    def _run(self, **_ignored) -> str:
+    def prefetch(self) -> None:
+        """Read the PDF before any agent runs; raise DocumentUnreadable if it fails."""
         try:
             text = pdf_text(path=self.file_path)
         except Exception as error:
-            return f"Error reading PDF file {self.file_path}: {error}"
+            raise DocumentUnreadable(f"could not read the PDF {self.file_path}: {error}") from error
         if not text:
-            return f"Error reading PDF file {self.file_path}: no text layer (a scanned PDF needs OCR first)."
-        self.reads.append({"source": self.file_path, "selector": None, "chars": len(text)})
-        return _for_agent(text)
+            raise DocumentUnreadable(
+                f"the PDF {self.file_path} has no text layer (a scanned PDF needs OCR first).")
+        self._text = text
+
+    def _run(self, **_ignored) -> str:
+        if self._text is None:
+            try:
+                self.prefetch()
+            except DocumentUnreadable as error:
+                return f"Error: {error}"
+        assert self._text is not None
+        self.reads.append({"source": self.file_path, "selector": None, "chars": len(self._text)})
+        return _for_agent(self._text)

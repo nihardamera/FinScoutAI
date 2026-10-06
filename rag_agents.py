@@ -47,7 +47,13 @@ from langchain_ollama import OllamaEmbeddings  # noqa: E402
 from langchain_text_splitters import MarkdownHeaderTextSplitter  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
-from utils import MAX_DOCUMENT_CHARS, AdvancedScrapeTool, PDFReadTool, ToolInput  # noqa: E402
+from utils import (  # noqa: E402
+    MAX_DOCUMENT_CHARS,
+    AdvancedScrapeTool,
+    DocumentUnreadable,
+    PDFReadTool,
+    ToolInput,
+)
 
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 CHAT_MODEL = os.getenv("FINSCOUT_CHAT_MODEL", "llama3:8b")
@@ -406,8 +412,12 @@ def run_crew(source: str, selector: str | None = None, verbose: bool = False) ->
     """
     source = source.strip()
     selector = (selector or "").strip() or None
-    get_vector_store()  # build the knowledge base before the agents need it
     run = build_crew(source, selector, verbose=verbose)
+    try:
+        run.reader.prefetch()  # fail now, with the real reason, if the document can't be read
+    except DocumentUnreadable as error:
+        raise RuntimeError(f"No report was produced: {error}") from error
+    get_vector_store()  # build the knowledge base before the agents need it
     unread = (
         "The Regulatory Interpreter did not manage to read the document, so no report was produced."
     )
