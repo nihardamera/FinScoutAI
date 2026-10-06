@@ -11,6 +11,9 @@ import pytest
 from rag_agents import (
     KnowledgeBaseQuery,
     _load_knowledge_base,
+    assessment_problems,
+    final_verdict,
+    plan_problems,
     _unfence,
     _verdict,
     contradictory_ratings,
@@ -159,3 +162,48 @@ class TestReadingBeforeTheAgentsStart:
         tool.prefetch()
         tool._run()
         assert calls == ["https://example.org/circular"]
+
+
+GOOD_ASSESSMENT = """Change: Two-factor authentication for digital payments
+  - Applies to FlexiPay: Yes, it runs UPI payments (products.md)
+  - What FlexiPay does today: UPI PIN and device binding (fraud_risk_policy.md)
+  - What FlexiPay must change: Nothing
+  - Impact: None
+Change: Risk-based checks on high-risk transactions
+  - Applies to FlexiPay: Yes (fraud_risk_policy.md)
+  - What FlexiPay does today: fixed rules only
+  - What FlexiPay must change: add behavioural checks
+  - Impact: Medium"""
+
+
+class TestCodeChecksOverrideTheModel:
+    """In a real run Llama 3 8B returned an empty impact assessment and the
+    verification agent still answered CONSISTENT. These checks need no model."""
+
+    def test_an_empty_assessment_is_caught(self):
+        assert assessment_problems("") == [
+            "the impact assessment is empty or has no 'Change:' entries"]
+
+    def test_a_change_without_ratings_is_caught(self):
+        problems = assessment_problems("Change: Two-factor authentication\n- Notes: important")
+        assert problems == ["change 1 in the assessment has no Applies to FlexiPay or Impact rating"]
+
+    def test_a_well_formed_assessment_passes(self):
+        assert assessment_problems(GOOD_ASSESSMENT) == []
+
+    def test_a_plan_that_says_nothing_is_needed_but_lists_actions_is_caught(self):
+        plan = "1. Review policies\n2. Train staff\n3. Audit\nNo changes are needed."
+        assert "lists 3 actions" in plan_problems(plan, GOOD_ASSESSMENT)[0]
+
+    def test_nothing_needed_contradicts_a_rated_change(self):
+        problems = plan_problems("No changes are needed.\n1. Record this.", GOOD_ASSESSMENT)
+        assert any("rates a change High, Medium or Low" in p for p in problems)
+
+    def test_a_plan_with_actions_for_a_rated_change_passes(self):
+        plan = "1. Add behavioural checks to the fraud engine. Owner: Engineering."
+        assert plan_problems(plan, GOOD_ASSESSMENT) == []
+
+    def test_the_model_cannot_pass_what_code_failed(self):
+        assert final_verdict("CONSISTENT", ["the impact assessment is empty"]) == "INCONSISTENT"
+        assert final_verdict("CONSISTENT", []) == "CONSISTENT"
+        assert final_verdict("UNCLEAR", []) == "UNCLEAR"

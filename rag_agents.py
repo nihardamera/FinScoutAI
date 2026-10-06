@@ -213,6 +213,12 @@ def build_crew(source: str, selector: str | None = None, verbose: bool = False) 
                 f"least {MIN_SEARCHES} searches with the search_knowledge_base tool, one specific "
                 "question per change in the summary."
             )
+        if not _CHANGE_BLOCK.search(output.raw):
+            problems.append(
+                "Your assessment is empty or not in the required format. Write one block per "
+                "change, starting with 'Change:', each with 'Applies to FlexiPay', 'What FlexiPay "
+                "does today', 'What FlexiPay must change' and 'Impact'."
+            )
         if contradictory_ratings(output.raw):
             problems.append(
                 "A change marked 'Applies to FlexiPay: No' must have 'What FlexiPay must change: "
@@ -221,6 +227,20 @@ def build_crew(source: str, selector: str | None = None, verbose: bool = False) 
         if not problems or analyst_attempts["count"] > 2:
             return True, output  # after two retries, accept; the report states what is wrong
         return False, " ".join(problems) + " Then write the assessment again."
+
+    advisor_attempts = {"count": 0}
+
+    def plan_is_consistent(output: TaskOutput):
+        advisor_attempts["count"] += 1
+        assessment = impact_task.output.raw if impact_task.output else ""
+        problems = plan_problems(output.raw, assessment)
+        if not problems or advisor_attempts["count"] > 2:
+            return True, output  # after two retries, accept; the report states what is wrong
+        return False, (
+            "Your plan is inconsistent: " + "; ".join(problems) + ". Give one or more actions "
+            "for each change rated High, Medium or Low, or, only if every change is rated None, "
+            "write 'No changes are needed.' and at most two record-keeping steps."
+        )
 
     interpreter = Agent(
         role="Regulatory Interpreter",
@@ -336,6 +356,8 @@ def build_crew(source: str, selector: str | None = None, verbose: bool = False) 
         ),
         agent=advisor,
         context=[impact_task],
+        guardrail=plan_is_consistent,
+        guardrail_max_retries=2,
     )
     verify_task = Task(
         description=(
@@ -381,6 +403,59 @@ class Report:
     markdown: str
     verdict: str  # "CONSISTENT", "INCONSISTENT" or "UNCLEAR"
     warnings: list[str] = field(default_factory=list)
+
+
+_CHANGE_BLOCK = re.compile(r"(?im)^\W*change:")
+_NO_CHANGES = re.compile(r"(?i)no changes are needed")
+_NUMBERED = re.compile(r"(?m)^\s*\d+[.)]\s+\S")
+_RATED = re.compile(r"(?i)impact\W*(high|medium|low)\b")
+
+
+def assessment_problems(assessment: str) -> list[str]:
+    """What is wrong with an impact assessment's shape, found by code.
+
+    A small model can return an empty assessment, and the verification agent
+    has been seen to pass one anyway. These checks do not depend on any model.
+    """
+    blocks = _CHANGE_BLOCK.split(assessment)[1:]
+    if not blocks:
+        return ["the impact assessment is empty or has no 'Change:' entries"]
+    problems = []
+    for number, block in enumerate(blocks, 1):
+        missing = [field for field, pattern in (
+            ("Applies to FlexiPay", r"(?i)applies to flexipay\W*(yes|no)\b"),
+            ("Impact", r"(?i)impact\W*(high|medium|low|none)\b"),
+        ) if not re.search(pattern, block)]
+        if missing:
+            problems.append(f"change {number} in the assessment has no {' or '.join(missing)} rating")
+    if contradictory_ratings(assessment):
+        problems.append("the assessment rates a change that does not apply to FlexiPay as "
+                        "High, Medium or Low")
+    return problems
+
+
+def plan_problems(plan: str, assessment: str) -> list[str]:
+    """Contradictions between the action plan and the assessment, found by code."""
+    problems = []
+    says_nothing_needed = bool(_NO_CHANGES.search(plan))
+    actions = len(_NUMBERED.findall(plan))
+    if says_nothing_needed and actions > 2:
+        problems.append(f"the plan says 'No changes are needed' but lists {actions} actions")
+    if says_nothing_needed and _RATED.search(assessment):
+        problems.append("the plan says 'No changes are needed' but the assessment rates a "
+                        "change High, Medium or Low")
+    if not says_nothing_needed and actions == 0:
+        problems.append("the plan has no actions and does not say that no changes are needed")
+    return problems
+
+
+def final_verdict(model_verdict: str, code_problems: list[str]) -> str:
+    """The verifier's verdict, unless code found a problem it missed.
+
+    A model saying CONSISTENT is never allowed to outrank a check that is
+    certain: if code found a problem, the report is INCONSISTENT.
+    """
+    return "INCONSISTENT" if code_problems else model_verdict
 
 
 def contradictory_ratings(assessment: str) -> bool:
@@ -444,18 +519,20 @@ def run_crew(source: str, selector: str | None = None, verbose: bool = False) ->
         )
 
     summary, impact, plan, verification = (_unfence(output.raw) for output in result.tasks_output)
-    if contradictory_ratings(impact):
-        warnings.append(
-            "The impact assessment rates a change that it says does not apply to FlexiPay as "
-            "High, Medium or Low."
-        )
-    verdict = _verdict(verification)
+    code_problems = assessment_problems(impact) + plan_problems(plan, impact)
+    model_verdict = _verdict(verification)
+    verdict = final_verdict(model_verdict, code_problems)
+    if code_problems and model_verdict == "CONSISTENT":
+        warnings.append("The verification agent said CONSISTENT, but the code checks found "
+                        "problems it missed.")
 
     lines = [
         f"# FinScout report: {source}",
         "",
         f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} with {CHAT_MODEL} on Ollama",
-        f"- Verifier verdict: {verdict}",
+        f"- Verdict: {verdict}",
+        f"- Code checks: {'passed' if not code_problems else '; '.join(code_problems)}",
+        f"- Verification agent said: {model_verdict}",
         "- Status: draft for human review",
     ]
     lines += [f"- Warning: {warning}" for warning in warnings]

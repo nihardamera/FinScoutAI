@@ -36,7 +36,7 @@ def main() -> int:
         print(report.markdown)
     for warning in report.warnings:
         print(f"Warning: {warning}", file=sys.stderr)
-    print(f"Finished in {elapsed:.0f} s. Verifier verdict: {report.verdict}", file=sys.stderr)
+    print(f"Finished in {elapsed:.0f} s. Verdict: {report.verdict}", file=sys.stderr)
     return 0
 
 
