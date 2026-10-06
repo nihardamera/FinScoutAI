@@ -224,6 +224,13 @@ def build_crew(source: str, selector: str | None = None, verbose: bool = False) 
                 "A change marked 'Applies to FlexiPay: No' must have 'What FlexiPay must change: "
                 "Nothing' and 'Impact: None'."
             )
+        summary = interpret_task.output.raw if interpret_task.output else ""
+        for problem in coverage_problems(summary, output.raw):
+            problems.append(
+                f"In your assessment, {problem}. Assess exactly the changes listed in the summary, "
+                "one 'Change:' block each, and search the knowledge base for each of them.")
+        if any("needs no change yet is rated" in p for p in assessment_problems(output.raw)):
+            problems.append("If FlexiPay must change Nothing, the Impact is None.")
         if not problems or analyst_attempts["count"] > 2:
             return True, output  # after two retries, accept; the report states what is wrong
         return False, " ".join(problems) + " Then write the assessment again."
@@ -437,6 +444,43 @@ def change_blocks(assessment: str) -> list[str]:
     return blocks
 
 
+_BULLET = re.compile(r"(?m)^\s*(?:[-*\u2022]|\d+[.)])\s+(.+)$")
+_STOPWORDS = frozenset(
+    "the and for with that this from into their which shall must will have been "
+    "such other under where when than more each also only least based".split())
+
+
+def _keywords(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 3 and w not in _STOPWORDS}
+
+
+def summary_changes(summary: str) -> list[str]:
+    """The bulleted changes listed in the interpreter's summary."""
+    return [m.group(1).strip() for m in _BULLET.finditer(summary)]
+
+
+def coverage_problems(summary: str, assessment: str) -> list[str]:
+    """Changes in the summary that no change in the assessment talks about.
+
+    A word-overlap test, deliberately loose: a change counts as covered if any
+    assessed change shares at least two of its significant words. It is meant
+    to catch an assessment about the wrong subject entirely, which a small
+    model produced when its knowledge-base search drifted, not to grade
+    wording.
+    """
+    titles = [_keywords(block.splitlines()[0] + " " + " ".join(block.splitlines()[1:2]))
+              for block in change_blocks(assessment)]
+    missing = []
+    for change in summary_changes(summary):
+        words = _keywords(change)
+        if len(words) >= 2 and not any(len(words & title) >= 2 for title in titles):
+            missing.append(change)
+    if missing:
+        listed = "; ".join(m if len(m) <= 80 else m[:77] + "..." for m in missing)
+        return [f"the assessment does not cover {len(missing)} change(s) in the summary: {listed}"]
+    return []
+
+
 def assessment_problems(assessment: str) -> list[str]:
     """What is wrong with an impact assessment's shape, found by code.
 
@@ -454,6 +498,9 @@ def assessment_problems(assessment: str) -> list[str]:
         ) if not re.search(pattern, block)]
         if missing:
             problems.append(f"change {number} in the assessment has no {' or '.join(missing)} rating")
+        elif (re.search(r"(?i)must change\W*nothing\b", block)
+              and re.search(r"(?i)impact\W*(high|medium|low)\b", block)):
+            problems.append(f"change {number} needs no change yet is rated High, Medium or Low")
     if contradictory_ratings(assessment):
         problems.append("the assessment rates a change that does not apply to FlexiPay as "
                         "High, Medium or Low")
@@ -545,7 +592,8 @@ def run_crew(source: str, selector: str | None = None, verbose: bool = False) ->
         )
 
     summary, impact, plan, verification = (_unfence(output.raw) for output in result.tasks_output)
-    code_problems = assessment_problems(impact) + plan_problems(plan, impact)
+    code_problems = (assessment_problems(impact) + coverage_problems(summary, impact)
+                     + plan_problems(plan, impact))
     model_verdict = _verdict(verification)
     verdict = final_verdict(model_verdict, code_problems)
     if code_problems and model_verdict == "CONSISTENT":

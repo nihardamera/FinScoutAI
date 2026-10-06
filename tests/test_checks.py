@@ -13,6 +13,7 @@ from rag_agents import (
     _load_knowledge_base,
     assessment_problems,
     change_blocks,
+    coverage_problems,
     final_verdict,
     plan_problems,
     _unfence,
@@ -233,3 +234,29 @@ class TestReadingTheAssessmentFormat:
         assessment = ("Change: A\n- Change: explanation\n- Applies to FlexiPay: No\n"
                       "- Impact: High")
         assert contradictory_ratings(assessment)
+
+
+class TestCoverageAndRatingRules:
+    SUMMARY = ("Key changes:\n"
+               "• Minimum two factors of authentication for digital payment transactions\n"
+               "• Risk-based approach for high-risk transactions\n")
+
+    def test_an_assessment_about_the_wrong_subject_is_caught(self):
+        """What happened on a real run: the circular was about authentication,
+        the analyst's search drifted, and it assessed KYC record-keeping."""
+        off_topic = ("Change: Periodic updation of KYC records\n- Applies to FlexiPay: Yes\n"
+                     "- What FlexiPay must change: Nothing\n- Impact: None")
+        problems = coverage_problems(self.SUMMARY, off_topic)
+        assert problems and "does not cover 2 change(s)" in problems[0]
+
+    def test_an_assessment_of_the_listed_changes_is_covered(self):
+        on_topic = ("Change: Two factors of authentication for digital payments\n"
+                    "- Applies to FlexiPay: Yes\n- Impact: None\n"
+                    "Change: Risk-based checks on high-risk transactions\n"
+                    "- Applies to FlexiPay: Yes\n- Impact: Medium")
+        assert coverage_problems(self.SUMMARY, on_topic) == []
+
+    def test_nothing_to_change_means_no_impact(self):
+        block = ("Change: KYC records\n- Applies to FlexiPay: Yes\n"
+                 "- What FlexiPay must change: Nothing, it already complies\n- Impact: Low")
+        assert assessment_problems(block) == ["change 1 needs no change yet is rated High, Medium or Low"]
