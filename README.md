@@ -1,71 +1,91 @@
-# 🕵️ FinScout AI v2: Autonomous Regulatory Intelligence System
+# FinScout AI
 
-**FinScout AI is a multi-agent system that automates the entire workflow of regulatory compliance for financial technology companies.** It proactively monitors web pages and PDF documents for new regulations, interprets their meaning, analyzes their business impact using a sophisticated RAG pipeline, formulates a strategic action plan, and verifies its own work for accuracy.
+Give it a regulatory circular, as a web page or a PDF, and it writes an impact
+assessment and an action plan for FlexiPay India, a fictional Indian fintech.
+Four agents built with CrewAI do the work in sequence, all running on a local
+Llama 3 8B model through Ollama, so the document is never sent to an outside
+service. The report is a draft for a person to review; they then archive it as
+approved or flag it for follow-up.
 
-This project is built to be **100% free, private, and offline-capable**, running entirely on local open-source models.
+A report produced by the current code, unedited, is in
+[`examples/sample_report.md`](examples/sample_report.md).
 
----
+## The four agents
 
-## ✨ Key Features & Improvements
+| Agent | Job | Tools |
+| --- | --- | --- |
+| Regulatory Interpreter | Reads the circular and summarises what changes, with paragraph numbers | A reader bound to the one document you chose (web page or PDF) |
+| Business Impact Analyst | Decides, change by change, whether it applies to FlexiPay and what would have to change | Search over FlexiPay's internal policies in a Chroma vector database |
+| Strategy and Compliance Advisor | Turns the assessment into a prioritised action plan | None |
+| Verification Specialist | Checks the summary, the assessment and the plan against each other and gives a verdict | None |
 
-* **Multi-Source Ingestion:** Analyzes regulations from both **live URLs** and uploaded **PDF documents**.
-* **Advanced RAG Pipeline:**
-    * **Semantic Chunking:** Splits documents based on meaning, not arbitrary length, for superior context.
-    * **Multi-Query Retriever:** The AI automatically rewrites a single question into multiple perspectives to find more comprehensive and accurate information in the knowledge base.
-* **Self-Correction & Verification:** A dedicated `Verification Agent` reviews the final output, cross-referencing it against the source material to reduce errors and hallucinations.
-* **Persistent Memory:** Every analysis is saved to a local **SQLite database**, creating a searchable archive of past compliance work.
-* **Human-in-the-Loop (HITL) Simulation:** The UI includes a feedback mechanism (`Approve` / `Flag for Review`) to simulate a real-world workflow where a human compliance officer oversees the AI's work.
-* **Optimized for Local Performance:** Uses lightweight, high-performance local models (`llama3:8b` and `nomic-embed-text`) for fast and efficient operation on consumer hardware.
+Each agent has only the tool its job needs. Only the analyst can search the
+policies, and only the interpreter can read the document.
 
----
+## The checks around the agents
 
-## 🏛️ System Architecture
+A small model left to itself will sometimes summarise a document it never
+opened, or rate a change as "does not apply" and "high impact" at once. Code,
+not the model, checks for these and sends the answer back with the reason:
 
-The system is designed as a collaborative "Crew" of four specialized AI agents:
+- The summary is rejected if the reader tool was never called, if it copies the
+  circular instead of summarising it, or if it lists no changes.
+- The assessment is rejected if the analyst made fewer than three knowledge-base
+  searches, or if a change marked as not applying still has an impact rating.
+  After two retries it is accepted, and the report says what is still wrong.
+- The verifier must end with `VERDICT: CONSISTENT` or `VERDICT: INCONSISTENT`.
+  The verdict is read from that line by code; if it is missing the report says
+  `UNCLEAR` rather than assuming a pass.
+- Every knowledge-base search and what it returned is listed at the end of the
+  report, so a reader can see what the assessment was based on.
+- Documents longer than 12,000 characters are cut, and the report says so.
 
-1.  **`Regulator-Interpreter`**: The legal expert. It uses advanced scraping and PDF reading tools to ingest and summarize the raw regulatory text.
-2.  **`Impact-Analyst`**: The business detective. It uses the advanced Multi-Query RAG tool to search the company's internal knowledge base and pinpoint exactly which products and processes are affected by the new rule.
-3.  **`Strategy-Advisor`**: The consultant. It synthesizes the impact analysis into a clear, prioritized, and actionable strategic plan for different departments.
-4.  **`Verification-Agent`**: The fact-checker. As the final step, it reviews the entire workflow to ensure the strategic plan is logically derived from and consistent with the source regulation.
+## Setup
 
+Requires Python 3.12 and [Ollama](https://ollama.com).
 
-
----
-
-## 🚀 Getting Started
-
-### **Prerequisites**
-* Python 3.9+
-* [Ollama](https://ollama.com) installed and running on your machine.
-
-### **Setup Instructions**
-
-1.  **Clone the repository:**
-    ```bash
-    git clone [https://github.com/your-username/finscout-ai.git](https://github.com/your-username/finscout-ai.git)
-    cd finscout-ai
-    ```
-
-2.  **Pull the necessary Ollama models:**
-    ```bash
-    ollama pull llama3:8b
-    ollama pull nomic-embed-text
-    ```
-
-3.  **Create a virtual environment and install dependencies:**
-    This single command creates the environment, activates it, and installs all required packages.
-
-    * **For macOS / Linux:**
-        ```bash
-        python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
-        ```
-    * **For Windows (Command Prompt):**
-        ```powershell
-        python -m venv venv && venv\Scripts\activate && pip install -r requirements.txt
-        ```
-
-### **Running the Application**
-
-With your virtual environment active and Ollama running, start the Streamlit app:
 ```bash
-streamlit run app.py
+git clone https://github.com/nihardamera/FinScoutAI.git
+cd FinScoutAI
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/playwright install chromium
+
+ollama pull llama3:8b
+ollama pull nomic-embed-text
+```
+
+The knowledge base (`knowledge_base/*.md`) is embedded with `nomic-embed-text`
+on first use and stored in `chroma_db/`. It is rebuilt automatically when the
+files change. `FINSCOUT_CHAT_MODEL` and `OLLAMA_BASE_URL` override the model
+and the Ollama address.
+
+## Run
+
+```bash
+.venv/bin/streamlit run app.py                     # web UI with the archive
+.venv/bin/python cli.py "<circular URL or PDF path>" --out report.md
+```
+
+Without a CSS selector the reader keeps the page's main text and drops menus
+and footers. On RBI notification pages `table.tablebg` selects just the
+circular. On an Apple M4 laptop a run takes two to four minutes.
+
+```bash
+.venv/bin/python -m pytest      # the reading and checking code; no model needed
+```
+
+## Limitations
+
+- The knowledge base describes a fictional company in six short documents. It
+  shows how the retrieval works; it is not a real compliance corpus.
+- The verifier only compares the three outputs with each other. It does not
+  see the circular or the policies, so it can catch contradictions but not a
+  summary that misreads the source.
+- Llama 3 8B is a small model. Its checks are shallow: in the sample report the
+  plan says "No changes are needed" and then lists two filing steps, and the
+  verifier does not object. Treat every report as a first draft.
+- It analyses one document per run, on demand. It does not monitor regulators'
+  websites.
+- The archive (SQLite) is a list of past reports with their status; it is not
+  searchable.
