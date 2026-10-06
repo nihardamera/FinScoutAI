@@ -411,13 +411,39 @@ _NUMBERED = re.compile(r"(?m)^\s*\d+[.)]\s+\S")
 _RATED = re.compile(r"(?i)impact\W*(high|medium|low)\b")
 
 
+_IMPACT_LINE = re.compile(r"(?i)impact\W*(high|medium|low|none)\b")
+
+
+def change_blocks(assessment: str) -> list[str]:
+    """Split an assessment into one block per change.
+
+    A `Change:` line starts a new block only once the current block has its
+    Impact rating. Models sometimes add an explanatory "- Change: ..." line
+    inside a block, and splitting on every such line made one change look like
+    two, the first with no ratings at all.
+    """
+    blocks: list[str] = []
+    current: list[str] | None = None
+    for line in assessment.splitlines():
+        starts = _CHANGE_BLOCK.match(line) is not None
+        if starts and (current is None or _IMPACT_LINE.search("\n".join(current))):
+            if current is not None:
+                blocks.append("\n".join(current))
+            current = [line]
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        blocks.append("\n".join(current))
+    return blocks
+
+
 def assessment_problems(assessment: str) -> list[str]:
     """What is wrong with an impact assessment's shape, found by code.
 
     A small model can return an empty assessment, and the verification agent
     has been seen to pass one anyway. These checks do not depend on any model.
     """
-    blocks = _CHANGE_BLOCK.split(assessment)[1:]
+    blocks = change_blocks(assessment)
     if not blocks:
         return ["the impact assessment is empty or has no 'Change:' entries"]
     problems = []
@@ -460,7 +486,7 @@ def final_verdict(model_verdict: str, code_problems: list[str]) -> str:
 
 def contradictory_ratings(assessment: str) -> bool:
     """True if a change marked as not applying to FlexiPay is still rated High, Medium or Low."""
-    for block in re.split(r"(?im)^\W*change:", assessment):
+    for block in change_blocks(assessment):
         applies = re.search(r"(?i)applies to flexipay\W*(yes|no)\b", block)
         impact = re.search(r"(?i)impact\W*(high|medium|low|none)\b", block)
         if applies and impact and applies.group(1).lower() == "no" and impact.group(1).lower() != "none":

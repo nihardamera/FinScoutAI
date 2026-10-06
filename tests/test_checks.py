@@ -12,6 +12,7 @@ from rag_agents import (
     KnowledgeBaseQuery,
     _load_knowledge_base,
     assessment_problems,
+    change_blocks,
     final_verdict,
     plan_problems,
     _unfence,
@@ -207,3 +208,28 @@ class TestCodeChecksOverrideTheModel:
         assert final_verdict("CONSISTENT", ["the impact assessment is empty"]) == "INCONSISTENT"
         assert final_verdict("CONSISTENT", []) == "CONSISTENT"
         assert final_verdict("UNCLEAR", []) == "UNCLEAR"
+
+
+class TestReadingTheAssessmentFormat:
+    def test_an_explanation_line_inside_a_change_does_not_split_it(self):
+        """The exact shape Llama 3 8B produced on the RBI authentication
+        directions, which the first version of this check misread as ten
+        changes, half of them unrated."""
+        assessment = (
+            "Change: Minimum two factors of authentication\n"
+            "- Change: This change is already met by FlexiPay India.\n"
+            "- Applies to FlexiPay: Yes\n"
+            "- What FlexiPay must change: Nothing\n"
+            "- Impact: None\n"
+            "\n"
+            "Change: Cross-border card-not-present checks\n"
+            "- Change: This change does not apply to FlexiPay India.\n"
+            "- Applies to FlexiPay: No\n"
+            "- Impact: None\n")
+        assert len(change_blocks(assessment)) == 2
+        assert assessment_problems(assessment) == []
+
+    def test_a_contradiction_is_still_found_inside_such_a_block(self):
+        assessment = ("Change: A\n- Change: explanation\n- Applies to FlexiPay: No\n"
+                      "- Impact: High")
+        assert contradictory_ratings(assessment)
