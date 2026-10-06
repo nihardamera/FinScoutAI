@@ -1,77 +1,88 @@
-import streamlit as st
-import pandas as pd
 import os
-from rag_agents import run_crew
-from database import init_db, save_analysis, get_all_analyses
+
+import streamlit as st
+
+from database import get_all_analyses, init_db, save_analysis
+from rag_agents import CHAT_MODEL, run_crew
 
 init_db()
 
-st.set_page_config(page_title="FinScout AI v2", layout="wide")
+st.set_page_config(page_title="FinScout AI", layout="wide")
 
-st.sidebar.title("FinScout AI Navigation")
-page = st.sidebar.radio("Go to", ["Live Analysis", "Past Analyses Archive"])
+st.sidebar.title("FinScout AI")
+page = st.sidebar.radio("Go to", ["New analysis", "Archive"])
 
-if page == "Live Analysis":
-    st.title("🕵️ FinScout AI v2")
-    st.markdown("### Autonomous Regulatory Intelligence System")
-    
-    source_type = st.radio("Select source type", ["URL", "PDF File"], horizontal=True)
-    
+if page == "New analysis":
+    st.title("FinScout AI")
+    st.markdown(
+        "Impact assessment and action plan for a regulatory circular, written for "
+        f"FlexiPay India (a fictional fintech) by four agents running on a local `{CHAT_MODEL}` model."
+    )
+
+    source_type = st.radio("Source", ["URL", "PDF file"], horizontal=True)
+
     source = None
+    selector = None
     if source_type == "URL":
-        source = st.text_input("Enter URL of the regulatory circular:")
-        st.info("Hint: For RBI, a good CSS selector is often `#tdcontent`")
+        source = st.text_input("URL of the circular (web page or PDF)")
+        selector = st.text_input(
+            "CSS selector (optional)",
+            help=(
+                "Leave empty to let the reader find the main content. To limit it to one element, "
+                "give a selector, for example table.tablebg on RBI notification pages."
+            ),
+        )
     else:
         uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
         if uploaded_file is not None:
-            if not os.path.exists("temp"):
-                os.makedirs("temp")
-            file_path = os.path.join("temp", uploaded_file.name)
+            os.makedirs("temp", exist_ok=True)
+            file_path = os.path.join("temp", os.path.basename(uploaded_file.name))
             with open(file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             source = file_path
 
-    if st.button("Analyze Regulation"):
+    if st.button("Analyse"):
         if source:
-            with st.spinner("The AI agents are at work... This may take a few minutes."):
+            with st.spinner("The agents are working. On a laptop this takes several minutes."):
                 try:
-                    result = run_crew(source)
-                    st.session_state['last_analysis'] = result
-                    st.session_state['last_source'] = source
+                    st.session_state["last_report"] = run_crew(source, selector)
                 except Exception as e:
-                    st.error(f"An error occurred: {e}")
+                    st.error(f"The analysis failed: {e}")
         else:
-            st.warning("Please provide a source (URL or PDF).")
+            st.warning("Give a URL or upload a PDF first.")
 
-    if 'last_analysis' in st.session_state:
-        st.subheader("Analysis Complete!")
-        st.markdown(st.session_state['last_analysis'])
-        
-        st.subheader("Human-in-the-Loop Feedback")
-        st.write("Save this analysis to the archive for future reference.")
+    if "last_report" in st.session_state:
+        report = st.session_state["last_report"]
+        st.subheader("Report")
+        if report.verdict == "CONSISTENT":
+            st.info("The verification agent found the summary, impact assessment and plan consistent.")
+        else:
+            st.warning(f"The verification agent's verdict is {report.verdict}. See section 4 of the report.")
+        st.markdown(report.markdown)
+
+        st.subheader("Review")
+        st.write("The report is a draft. Archive it as approved or flag it for follow-up.")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("✅ Approve & Save Analysis"):
-                save_analysis(st.session_state['last_source'], st.session_state['last_analysis'], "approved")
-                st.success("Analysis approved and saved to the archive!")
-                del st.session_state['last_analysis']
+            if st.button("Approve and archive"):
+                save_analysis(report.source, report.markdown, "approved")
+                st.success("Saved to the archive as approved.")
+                del st.session_state["last_report"]
         with col2:
-            if st.button("🚩 Flag & Save for Review"):
-                save_analysis(st.session_state['last_source'], st.session_state['last_analysis'], "flagged")
-                st.warning("Analysis flagged and saved to the archive.")
-                del st.session_state['last_analysis']
+            if st.button("Flag and archive"):
+                save_analysis(report.source, report.markdown, "flagged")
+                st.warning("Saved to the archive as flagged.")
+                del st.session_state["last_report"]
 
-elif page == "Past Analyses Archive":
-    st.title("📖 Past Analyses Archive")
-    st.markdown("Review all previously saved analyses.")
-    
+elif page == "Archive":
+    st.title("Archive")
+    st.markdown("Saved reports, newest first.")
+
     analyses = get_all_analyses()
     if analyses:
-        df = pd.DataFrame(analyses, columns=['ID', 'Source', 'Analysis', 'Status', 'Timestamp'])
-        
-        for index, row in df.iterrows():
-            status_color = "green" if row['Status'] == 'approved' else "orange"
-            with st.expander(f"**{row['Timestamp']}** | **Source:** `{row['Source']}` | **Status:** :{status_color}[{row['Status'].upper()}]"):
-                st.markdown(row['Analysis'])
+        for _id, source, analysis, status, timestamp in analyses:
+            status_color = "green" if status == "approved" else "orange"
+            with st.expander(f"**{timestamp}** | `{source}` | :{status_color}[{status.upper()}]"):
+                st.markdown(analysis)
     else:
-        st.info("No past analyses found in the database.")
+        st.info("No saved reports yet.")

@@ -1,142 +1,478 @@
-from crewai import Agent, Task, Crew, Process
-from langchain.tools import Tool
-from langchain_community.chat_models import ChatOllama
-from langchain.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceInstructEmbeddings
-from langchain_experimental.text_splitter import SemanticChunker
-from langchain.document_loaders import DirectoryLoader
-from langchain.retrievers.multi_query import MultiQueryRetriever
-from utils import PDFReadTool, AdvancedScrapeTool
+"""The FinScout crew: four agents that turn a regulatory circular into a report.
 
-# --- Setup Models and Embeddings ---
-llm = ChatOllama(model="llama3:8b", base_url="http://localhost:11434")
-embedding_function = HuggingFaceInstructEmbeddings(
-    model_name="nomic-embed-text",
-    model_kwargs={"device": "cpu"}
-)
+1. Regulatory Interpreter reads the circular (web page or PDF) and summarises it.
+2. Business Impact Analyst searches FlexiPay India's internal documents in a
+   Chroma vector database to find what the circular affects.
+3. Strategy and Compliance Advisor drafts an action plan from that assessment.
+4. Verification Specialist compares the three outputs with each other and
+   flags anything inconsistent.
 
-# --- Persistent Vector Store Setup with Semantic Chunking ---
-vectordb = Chroma(
-    persist_directory="./chroma_db", 
-    embedding_function=embedding_function
-)
+Each agent gets only the tools its job needs: the interpreter has one reader
+(web page or PDF, bound to the document the user chose), the analyst has the
+knowledge-base search, and the advisor and the verifier have no tools. All
+model calls go to a local Ollama server.
 
-def initialize_vector_store():
-    if vectordb._collection.count() == 0:
-        print("Knowledge base is empty. Initializing with Semantic Chunking...")
-        loader = DirectoryLoader('./knowledge_base', glob="**/*.md")
-        docs = loader.load()
-        semantic_chunker = SemanticChunker(embedding_function)
-        splits = semantic_chunker.create_documents([doc.page_content for doc in docs])
-        vectordb.add_documents(documents=splits, embedding=embedding_function)
-        print("Knowledge base initialized.")
+Nothing here runs at import time. The models, the vector store and the crew
+are created when ``run_crew`` is called.
+"""
 
-initialize_vector_store()
+from __future__ import annotations
 
-# --- Advanced RAG Tool with Multi-Query Retriever ---
-retriever = MultiQueryRetriever.from_llm(
-    retriever=vectordb.as_retriever(), 
-    llm=llm
-)
+import hashlib
+import os
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
 
-retriever_tool = Tool(
-    name="Company Knowledge Base Search",
-    description="Searches the company's knowledge base for relevant information about its products, infrastructure, and processes.",
-    func=retriever.invoke
-)
+# Keep every byte on this machine: switch off CrewAI's anonymous telemetry and
+# trace upload, Chroma's telemetry and LiteLLM's download of its model price list.
+for _name, _value in {
+    "CREWAI_DISABLE_TELEMETRY": "true",
+    "CREWAI_TRACING_ENABLED": "false",
+    "OTEL_SDK_DISABLED": "true",
+    "ANONYMIZED_TELEMETRY": "False",
+    "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+}.items():
+    os.environ.setdefault(_name, _value)
 
-# --- AGENTS ---
-regulator_interpreter = Agent(
-    role="Regulatory Interpreter",
-    goal="Scan regulatory documents from URLs or PDFs and interpret their core meaning.",
-    backstory="You are an expert legal analyst. Your strength is reading dense legal documents and extracting key points.",
-    llm=llm,
-    tools=[AdvancedScrapeTool(), PDFReadTool()],
-    allow_delegation=False,
-    verbose=True
-)
+from chromadb.config import Settings as ChromaSettings  # noqa: E402
+from crewai import LLM, Agent, Crew, Process, Task  # noqa: E402
+from crewai.tasks.task_output import TaskOutput  # noqa: E402
+from crewai.tools import BaseTool  # noqa: E402
+from langchain_chroma import Chroma  # noqa: E402
+from langchain_core.documents import Document  # noqa: E402
+from langchain_ollama import OllamaEmbeddings  # noqa: E402
+from langchain_text_splitters import MarkdownHeaderTextSplitter  # noqa: E402
+from pydantic import BaseModel, Field  # noqa: E402
 
-impact_analyst = Agent(
-    role="Business Impact Analyst",
-    goal="Analyze how regulatory changes affect the company's products, operations, and technical infrastructure.",
-    backstory="You are a seasoned business analyst at FlexiPay India. Your primary skill is using the 'Company Knowledge Base Search' tool to ask detailed questions and find precise information.",
-    llm=llm,
-    tools=[retriever_tool],
-    allow_delegation=False,
-    verbose=True
-)
+from utils import MAX_DOCUMENT_CHARS, AdvancedScrapeTool, PDFReadTool, ToolInput  # noqa: E402
 
-strategy_advisor = Agent(
-    role="Strategy and Compliance Advisor",
-    goal="Develop a high-level, actionable plan for the company to adapt to the new regulatory changes.",
-    backstory="You are a strategic advisor who translates complex regulatory impacts into clear, concise action plans for different departments.",
-    llm=llm,
-    allow_delegation=False,
-    verbose=True
-)
+OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+CHAT_MODEL = os.getenv("FINSCOUT_CHAT_MODEL", "llama3:8b")
+EMBEDDING_MODEL = "nomic-embed-text"
+# Llama 3 8B's full context. Ollama's default is smaller and would silently
+# drop the start of long prompts.
+CONTEXT_TOKENS = 8192
 
-verification_agent = Agent(
-    role="Verification Specialist",
-    goal="Verify the final strategic plan against the initial regulatory summary for consistency and accuracy.",
-    backstory="You are a meticulous fact-checker. Your job is to ensure that every recommendation in the final report is directly supported by the initial interpretation of the regulation.",
-    llm=llm,
-    allow_delegation=False,
-    verbose=True
-)
+APP_DIR = Path(__file__).resolve().parent
+KNOWLEDGE_BASE_DIR = APP_DIR / "knowledge_base"
+CHROMA_DIR = APP_DIR / "chroma_db"
+SEARCH_RESULTS = 4
 
-# --- TASKS ---
-interpret_task = Task(
-    description=(
-        "Read the content of the provided source: '{source}'. "
-        "If it's a URL, first inspect the page to find the main content's CSS selector (e.g., 'div#content', 'article.main'). "
-        "Then, use the advanced scraper with the URL and the selector to get clean text. "
-        "If it's a local file path, use the PDF reader. "
-        "Finally, provide a concise summary of the key regulatory changes."
-    ),
-    expected_output="A bullet-point summary of core changes from the clean, extracted text.",
-    agent=regulator_interpreter
-)
 
-impact_task = Task(
-    description=(
-        "Using the summary of regulatory changes, analyze the specific impact on FlexiPay India. "
-        "You MUST use the 'Company Knowledge Base Search' tool to ask multiple, specific questions. "
-        "Synthesize the answers you find to create a detailed analysis of the impact."
-    ),
-    expected_output="A detailed analysis of how each change affects specific parts of the company, citing the information retrieved from the knowledge base.",
-    agent=impact_analyst,
-    context=[interpret_task]
-)
+# --- Knowledge base -------------------------------------------------------
 
-strategy_task = Task(
-    description=(
-        "Based on the impact analysis, create a high-level, actionable strategic plan. "
-        "Outline the recommended next steps for key departments (e.g., Engineering, Operations, Legal)."
-    ),
-    expected_output="A prioritized list of actions for different departments to ensure compliance.",
-    agent=strategy_advisor,
-    context=[impact_task]
-)
+def _knowledge_base_fingerprint() -> str:
+    digest = hashlib.sha256(EMBEDDING_MODEL.encode())
+    for path in sorted(KNOWLEDGE_BASE_DIR.glob("**/*.md")):
+        digest.update(path.relative_to(KNOWLEDGE_BASE_DIR).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
 
-verification_task = Task(
-    description=(
-        "Review the entire analysis. Compare the initial regulatory summary with the final strategic plan. "
-        "Ensure the strategic advice is logically derived from the regulatory changes. "
-        "If everything is consistent, approve the report. If there are inconsistencies, point them out and provide a final corrected version."
-    ),
-    expected_output="A final, verified report. If inconsistencies were found, the report must include a section detailing the corrections made.",
-    agent=verification_agent,
-    context=[interpret_task, impact_task, strategy_task]
-)
 
-# --- CREW ---
-finscout_crew = Crew(
-    agents=[regulator_interpreter, impact_analyst, strategy_advisor, verification_agent],
-    tasks=[interpret_task, impact_task, strategy_task, verification_task],
-    process=Process.sequential,
-    verbose=2
-)
+def _load_knowledge_base() -> list[Document]:
+    """Load the markdown files and split them into one chunk per section."""
+    splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=[("##", "document"), ("###", "section")],
+        strip_headers=False,
+    )
+    chunks = []
+    for path in sorted(KNOWLEDGE_BASE_DIR.glob("**/*.md")):
+        for chunk in splitter.split_text(path.read_text(encoding="utf-8")):
+            chunk.metadata["source"] = path.name
+            chunks.append(chunk)
+    return chunks
 
-def run_crew(source: str):
-    result = finscout_crew.kickoff(inputs={'source': source})
-    return result
+
+@lru_cache(maxsize=1)
+def get_vector_store() -> Chroma:
+    """Open the Chroma store, building it on first use.
+
+    The collection name includes a hash of the knowledge-base files, so editing
+    a file makes the next run embed the documents again.
+    """
+    store = Chroma(
+        collection_name=f"flexipay_kb_{_knowledge_base_fingerprint()}",
+        embedding_function=OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_URL),
+        persist_directory=str(CHROMA_DIR),
+        client_settings=ChromaSettings(anonymized_telemetry=False, is_persistent=True),
+    )
+    if not store.get(limit=1)["ids"]:
+        chunks = _load_knowledge_base()
+        store.add_documents(chunks)
+        print(f"Knowledge base: embedded {len(chunks)} sections from {KNOWLEDGE_BASE_DIR}")
+    return store
+
+
+class KnowledgeBaseQuery(ToolInput):
+    query: str = Field(..., description="One specific question about FlexiPay India's products, policies or systems.")
+
+
+class KnowledgeBaseSearchTool(BaseTool):
+    name: str = "search_knowledge_base"
+    description: str = (
+        "Searches FlexiPay India's internal policy, product and infrastructure documents "
+        "and returns the most relevant sections, each labelled with its source file. "
+        "Ask one specific question per call, as plain text, for example: "
+        '{"query": "Where is customer data stored?"}'
+    )
+    args_schema: type[BaseModel] = KnowledgeBaseQuery
+    searches: list = Field(default_factory=list, exclude=True)
+
+    def _run(self, query: str) -> str:
+        results = get_vector_store().similarity_search(query, k=SEARCH_RESULTS)
+        self.searches.append({"query": query, "sources": [_label(doc) for doc in results]})
+        if not results:
+            return "No matching section found in the knowledge base."
+        return "\n\n".join(f"[Source: {_label(doc)}]\n{doc.page_content}" for doc in results)
+
+
+def _label(doc: Document) -> str:
+    section = doc.metadata.get("section")
+    return f"{doc.metadata['source']} > {section}" if section else doc.metadata["source"]
+
+
+# --- Crew -----------------------------------------------------------------
+
+def get_llm() -> LLM:
+    # LiteLLM's ollama_chat route lets us set num_ctx. CrewAI's native Ollama
+    # route cannot, and it also sends native tool definitions, which Llama 3
+    # rejects; through LiteLLM CrewAI falls back to text (ReAct) tool calls.
+    return LLM(
+        model=f"ollama_chat/{CHAT_MODEL}",
+        base_url=OLLAMA_URL,
+        is_litellm=True,
+        temperature=0.2,
+        num_ctx=CONTEXT_TOKENS,
+    )
+
+
+def _is_url(source: str) -> bool:
+    return bool(re.match(r"https?://", source.strip(), re.IGNORECASE))
+
+
+MIN_SEARCHES = 3
+SUMMARY_MAX_CHARS = 2000  # about 300 words
+
+
+@dataclass
+class CrewRun:
+    crew: Crew
+    reader: AdvancedScrapeTool | PDFReadTool
+    knowledge_base: KnowledgeBaseSearchTool
+
+
+def build_crew(source: str, selector: str | None = None, verbose: bool = False) -> CrewRun:
+    llm = get_llm()
+    # The interpreter gets one reader, bound to the document the user chose.
+    if _is_url(source):
+        reader = AdvancedScrapeTool(url=source, css_selector=selector)
+    else:
+        reader = PDFReadTool(file_path=source)
+    knowledge_base = KnowledgeBaseSearchTool()
+
+    # Guardrails return (passed, output or feedback). No return annotation: CrewAI
+    # inspects it at runtime and this module uses postponed annotations.
+    def document_was_read(output: TaskOutput):
+        # Without this check a small model sometimes "summarises" a circular it never read.
+        if not reader.reads:
+            return False, (
+                f"You have not read the circular yet. Call the {reader.name} tool (it takes no "
+                "arguments, so give an empty Action Input) and summarise the text it returns."
+            )
+        # It also sometimes returns the whole text, or only the title, instead of a summary.
+        document_chars = min(reader.reads[-1]["chars"], MAX_DOCUMENT_CHARS)
+        if len(output.raw) > min(SUMMARY_MAX_CHARS, max(600, 0.6 * document_chars)):
+            return False, (
+                "Your answer copies the circular instead of summarising it. Write a summary in "
+                "your own words of at most 250 words, with the changes as short bullet points."
+            )
+        if not re.search(r"^\s*([-*\u2022]|\d+[.)])\s+\S", output.raw, re.MULTILINE):
+            return False, (
+                "Your summary lists no changes. Add each change or requirement in the circular "
+                "as a short bullet point, with its paragraph number."
+            )
+        return True, output
+
+    analyst_attempts = {"count": 0}
+
+    def assessment_is_grounded(output: TaskOutput):
+        analyst_attempts["count"] += 1
+        problems = []
+        if len(knowledge_base.searches) < MIN_SEARCHES:
+            problems.append(
+                f"You searched the knowledge base {len(knowledge_base.searches)} time(s). Make at "
+                f"least {MIN_SEARCHES} searches with the search_knowledge_base tool, one specific "
+                "question per change in the summary."
+            )
+        if contradictory_ratings(output.raw):
+            problems.append(
+                "A change marked 'Applies to FlexiPay: No' must have 'What FlexiPay must change: "
+                "Nothing' and 'Impact: None'."
+            )
+        if not problems or analyst_attempts["count"] > 2:
+            return True, output  # after two retries, accept; the report states what is wrong
+        return False, " ".join(problems) + " Then write the assessment again."
+
+    interpreter = Agent(
+        role="Regulatory Interpreter",
+        goal="Read a regulatory circular and summarise exactly what it requires.",
+        backstory=(
+            "You are a legal analyst at an Indian fintech. You read circulars from the RBI and "
+            "other regulators closely and report only what the text says."
+        ),
+        llm=llm,
+        tools=[reader],
+        allow_delegation=False,
+        max_iter=5,
+        verbose=verbose,
+    )
+    analyst = Agent(
+        role="Business Impact Analyst",
+        goal="Work out which FlexiPay India products, policies and systems a circular affects.",
+        backstory=(
+            "You are a business analyst at FlexiPay India, a fintech (not a bank) that runs a UPI "
+            "app and a wallet. You check every claim against the company's own documents by searching "
+            "the company knowledge base, and you say so when the documents are silent."
+        ),
+        llm=llm,
+        tools=[knowledge_base],
+        allow_delegation=False,
+        max_iter=8,
+        verbose=verbose,
+    )
+    advisor = Agent(
+        role="Strategy and Compliance Advisor",
+        goal="Turn an impact assessment into a short, prioritised action plan.",
+        backstory=(
+            "You are a compliance advisor who writes plans that name an owner, a priority and a "
+            "deadline for every action."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        max_iter=3,
+        verbose=verbose,
+    )
+    verifier = Agent(
+        role="Verification Specialist",
+        goal="Check that the summary, the impact assessment and the action plan agree with each other.",
+        backstory=(
+            "You are a careful reviewer. You do not add new analysis; you look for statements "
+            "that are unsupported by, or contradict, the earlier outputs."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        max_iter=3,
+        verbose=verbose,
+    )
+
+    interpret_task = Task(
+        description=(
+            f"Call the {reader.name} tool to get the text of the circular. It takes no arguments. "
+            "Then summarise the circular in your own words, using only that text. Give: its title, "
+            "issuer, reference number and date; who it applies to; each change or requirement as a "
+            "short bullet point, with its paragraph number where the text has one; and the "
+            "effective date or deadlines. Do not paste the text and do not use code blocks. Do not "
+            "add requirements that are not in the text. If the text ends with a note that it was "
+            "truncated, say that the summary covers only the part that was read. If the tool "
+            "returns an error, report the error and do not invent a summary."
+        ),
+        expected_output=(
+            "A markdown summary of at most 250 words: title, issuer, reference and date; who it "
+            "applies to; key changes as bullet points with paragraph references; effective date."
+        ),
+        agent=interpreter,
+        guardrail=document_was_read,
+        guardrail_max_retries=2,
+    )
+    impact_task = Task(
+        description=(
+            "Assess the impact of the circular summarised above on FlexiPay India. Work in this "
+            "order. First, list the changes in the summary. Second, for each change, call the "
+            "search_knowledge_base tool with one specific question about it (for example who "
+            "FlexiPay onboards, how it verifies identity, where it stores data, its limits or its "
+            "complaint handling, whichever the change touches). Make at least three searches "
+            "before you give your final answer. Third, write the assessment. Base every statement "
+            "about FlexiPay on a section a search returned and put its source file in brackets, "
+            "for example (kyc_policy.md). If no section covers a change, write 'No matching policy "
+            "found' instead of guessing. Rule: if a change does not apply to FlexiPay, then What "
+            "FlexiPay must change is Nothing and Impact is None."
+        ),
+        expected_output=(
+            "For each change in the summary, this block:\n"
+            "- Change: the change, as in the summary\n"
+            "  - Applies to FlexiPay: Yes or No, and why, with source file\n"
+            "  - What FlexiPay does today: from the knowledge base, with source file\n"
+            "  - What FlexiPay must change: the work needed to comply, or Nothing\n"
+            "  - Impact: High, Medium, Low or None"
+        ),
+        agent=analyst,
+        context=[interpret_task],
+        guardrail=assessment_is_grounded,
+        guardrail_max_retries=2,
+    )
+    plan_task = Task(
+        description=(
+            "Draft an action plan from the impact assessment. For each change with Impact High, "
+            "Medium or Low, give one or more actions that do what the assessment says FlexiPay "
+            "must change, each with an owner (Compliance, Legal, Engineering, Operations or "
+            "Product), a priority and a target date relative to the circular's effective date. "
+            "Do not propose actions for changes with Impact None. If every change has Impact None, "
+            "write only 'No changes are needed.' followed by at most two steps that record this "
+            "conclusion. Never write both a list of actions and 'No changes are needed.' Do not "
+            "add work that the assessment does not mention."
+        ),
+        expected_output=(
+            "A numbered list of actions (action, owner, priority, target date, and the change it "
+            "addresses), or 'No changes are needed.' followed by at most two record-keeping steps."
+        ),
+        agent=advisor,
+        context=[impact_task],
+    )
+    verify_task = Task(
+        description=(
+            "Compare the summary of the circular, the impact assessment and the action plan with "
+            "each other. You do not have the circular or the knowledge base, only these three "
+            "outputs. Make these four checks, one at a time, quoting the text you rely on. "
+            "(1) Coverage: list the changes in the summary; FAIL if any of them is missing from "
+            "the impact assessment. "
+            "(2) Ratings: for each change in the impact assessment, quote 'Applies to FlexiPay', "
+            "'What FlexiPay must change' and 'Impact'. The correct combinations are: No, Nothing, "
+            "None; or Yes, Nothing, None; or Yes, some work, High or Medium or Low. PASS if every "
+            "change has a correct combination, otherwise FAIL. "
+            "(3) Plan: FAIL if the plan says 'No changes are needed' and also lists actions, if a "
+            "change rated High, Medium or Low has no action, or if an action asks for work the "
+            "assessment does not call for. "
+            "(4) Facts: FAIL if dates, amounts or who the circular applies to differ between the "
+            "three outputs. "
+            "For each check write its number, PASS or FAIL, and the reason. End with a final line "
+            "that is exactly 'VERDICT: CONSISTENT' if all four checks pass, or 'VERDICT: "
+            "INCONSISTENT' if any fails."
+        ),
+        expected_output="Four short paragraphs, one per check (PASS or FAIL with the quoted reason), then a last line 'VERDICT: CONSISTENT' or 'VERDICT: INCONSISTENT'.",
+        agent=verifier,
+        context=[interpret_task, impact_task, plan_task],
+    )
+
+    crew = Crew(
+        agents=[interpreter, analyst, advisor, verifier],
+        tasks=[interpret_task, impact_task, plan_task, verify_task],
+        process=Process.sequential,
+        memory=False,
+        tracing=False,
+        verbose=verbose,
+    )
+    return CrewRun(crew=crew, reader=reader, knowledge_base=knowledge_base)
+
+
+# --- Entry point ----------------------------------------------------------
+
+@dataclass
+class Report:
+    source: str
+    markdown: str
+    verdict: str  # "CONSISTENT", "INCONSISTENT" or "UNCLEAR"
+    warnings: list[str] = field(default_factory=list)
+
+
+def contradictory_ratings(assessment: str) -> bool:
+    """True if a change marked as not applying to FlexiPay is still rated High, Medium or Low."""
+    for block in re.split(r"(?im)^\W*change:", assessment):
+        applies = re.search(r"(?i)applies to flexipay\W*(yes|no)\b", block)
+        impact = re.search(r"(?i)impact\W*(high|medium|low|none)\b", block)
+        if applies and impact and applies.group(1).lower() == "no" and impact.group(1).lower() != "none":
+            return True
+    return False
+
+
+def _verdict(text: str) -> str:
+    """The verifier's last 'VERDICT: ...' line, or UNCLEAR if it did not write one."""
+    matches = re.findall(r"VERDICT:\W*(INCONSISTENT|CONSISTENT)", text, re.IGNORECASE)
+    return matches[-1].upper() if matches else "UNCLEAR"
+
+
+def _unfence(text: str) -> str:
+    """Remove a code fence wrapped around a whole answer so it renders as markdown."""
+    match = re.fullmatch(r"```[a-z]*\n(.*)\n```", text.strip(), re.DOTALL)
+    return match.group(1).strip() if match else text.strip()
+
+
+def run_crew(source: str, selector: str | None = None, verbose: bool = False) -> Report:
+    """Analyse one circular (a URL or a local PDF path) and return the report.
+
+    This is the entry point used by both the Streamlit app and cli.py.
+    """
+    source = source.strip()
+    selector = (selector or "").strip() or None
+    get_vector_store()  # build the knowledge base before the agents need it
+    run = build_crew(source, selector, verbose=verbose)
+    unread = (
+        "The Regulatory Interpreter did not manage to read the document, so no report was produced."
+    )
+    try:
+        result = run.crew.kickoff()
+    except Exception as error:
+        if not run.reader.reads:
+            raise RuntimeError(f"{unread} Last error: {error}") from error
+        raise RuntimeError(f"The crew stopped before finishing the report: {error}") from error
+    if not run.reader.reads:
+        raise RuntimeError(unread)
+
+    warnings = []
+    chars = max(read["chars"] for read in run.reader.reads)
+    if chars > MAX_DOCUMENT_CHARS:
+        warnings.append(
+            f"The document has {chars:,} characters; only the first {MAX_DOCUMENT_CHARS:,} were analysed."
+        )
+    searches = len(run.knowledge_base.searches)
+    if searches < MIN_SEARCHES:
+        warnings.append(
+            f"The Business Impact Analyst searched the knowledge base {searches} time(s), fewer than "
+            f"the {MIN_SEARCHES} it was asked for; parts of its assessment may not be grounded."
+        )
+
+    summary, impact, plan, verification = (_unfence(output.raw) for output in result.tasks_output)
+    if contradictory_ratings(impact):
+        warnings.append(
+            "The impact assessment rates a change that it says does not apply to FlexiPay as "
+            "High, Medium or Low."
+        )
+    verdict = _verdict(verification)
+
+    lines = [
+        f"# FinScout report: {source}",
+        "",
+        f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} with {CHAT_MODEL} on Ollama",
+        f"- Verifier verdict: {verdict}",
+        "- Status: draft for human review",
+    ]
+    lines += [f"- Warning: {warning}" for warning in warnings]
+    lines += [
+        "",
+        "## 1. Summary of the circular",
+        "",
+        summary,
+        "",
+        "## 2. Impact on FlexiPay India",
+        "",
+        impact,
+        "",
+        "## 3. Action plan",
+        "",
+        plan,
+        "",
+        "## 4. Verification",
+        "",
+        verification,
+        "",
+        "## Appendix: knowledge-base searches",
+        "",
+    ]
+    if run.knowledge_base.searches:
+        for search in run.knowledge_base.searches:
+            lines.append(f"- \"{search['query']}\" returned: {'; '.join(search['sources']) or 'nothing'}")
+    else:
+        lines.append("- None")
+    return Report(source=source, markdown="\n".join(lines) + "\n", verdict=verdict, warnings=warnings)
